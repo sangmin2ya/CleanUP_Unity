@@ -1,47 +1,100 @@
+using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.UI;
+using UnityEngine.Rendering;
 
 namespace CleanUp
 {
     /// <summary>
-    /// 오브젝트 표면의 더러움을 관리하고 청소 로직을 처리하는 컴포넌트입니다.
+    /// 브러시 한 번 찍기에 대한 정보입니다.
+    /// </summary>
+    public struct BrushStamp
+    {
+        public Vector3 position;
+        public Vector3 normal;
+        public float strength;
+        public float rotation;
+
+        public BrushStamp(Vector3 position, Vector3 normal, float strength, float rotation = 0f)
+        {
+            this.position = position;
+            this.normal = normal;
+            this.strength = strength;
+            this.rotation = rotation;
+        }
+    }
+
+    /// <summary>
+    /// 오브젝트 표면의 더러움을 GPU 마스크로 관리하고 청소 로직을 처리하는 컴포넌트입니다.
+    /// 브러시는 월드 공간 구 안의 표면을 닦으며, UV는 마스크 저장 위치로만 사용합니다.
     /// </summary>
     [RequireComponent(typeof(MeshRenderer))]
-    [RequireComponent(typeof(MeshCollider))]
+    [RequireComponent(typeof(MeshFilter))]
     public class DirtySurface : MonoBehaviour
     {
         #region SerializeField 필드
 
+        [Header("더러움 설정")]
         [SerializeField, Range(0f, 1f), Tooltip("초기 더러움 정도 (0=깨끗, 1=완전히 더러움)")]
         private float initialDirtAmount = 1.0f;
 
-        [SerializeField, Tooltip("리셋 버튼")]
-        private Button resetButton;
+        [SerializeField, Tooltip("더러움 마스크 해상도")]
+        private int maskResolution = 1024;
+
+        [SerializeField, Tooltip("메쉬에 UV2가 있으면 마스크용으로 사용 (겹치지 않는 UV 필요, 모델 Import의 Generate Lightmap UVs)")]
+        private bool useSecondaryUV = true;
+
+        [SerializeField, Range(0.05f, 2f), Tooltip("진행도 갱신 주기 (초)")]
+        private float progressUpdateInterval = 0.25f;
+
+        [Header("참조")]
+        [SerializeField, Tooltip("마스크 페인팅 셰이더 (Hidden/CleanUp/DirtPaint)")]
+        private Shader paintShader;
 
         #endregion
 
         #region Private 필드
-        private static int MaskResolution = 512; // 녹 텍스쳐 해상도
-        private Texture2D _dirtMask;
-        private Color[] _maskPixels;
+
+        private const string PaintShaderName = "Hidden/CleanUp/DirtPaint";
+        private const int PaintPass = 0;
+        private const int CoveragePass = 1;
+        private const int DilatePass = 2;
+
+        private static readonly int dirtMaskId = Shader.PropertyToID("_DirtMask");
+        private static readonly int maskUVChannelId = Shader.PropertyToID("_MaskUVChannel");
+        private static readonly int brushPosId = Shader.PropertyToID("_CleanBrushPosWS");
+        private static readonly int brushNormalId = Shader.PropertyToID("_CleanBrushNormalWS");
+        private static readonly int cameraPosId = Shader.PropertyToID("_CleanCameraPosWS");
+        private static readonly int maskSizeId = Shader.PropertyToID("_CleanMaskSize");
+        private static readonly int brushParamsId = Shader.PropertyToID("_CleanBrushParams");
+        private static readonly int brushTexId = Shader.PropertyToID("_CleanBrushTex");
+        private static readonly int falloffLutId = Shader.PropertyToID("_CleanFalloffLut");
+        private static readonly int sourceTexId = Shader.PropertyToID("_CleanSourceTex");
+        private static readonly int coverageTexId = Shader.PropertyToID("_CleanCoverageTex");
+        private static float[] halfToFloatTable;
+
         private MeshRenderer _meshRenderer;
+        private int _subMeshCount;
+        private float _maskUVChannel;
+        private Material _paintMaterial;
+        private CommandBuffer _commandBuffer;
+        private MaterialPropertyBlock _propertyBlock;
+
+        // 페인팅 대상 / 표시용(딜레이트 적용) / 메쉬 커버리지
+        private RenderTexture _maskTexture;
+        private RenderTexture _displayTexture;
+        private RenderTexture _coverageTexture;
+
+        private int[] _coveredIndices;
+        private ushort[] _readbackBuffer;
 
         private float _totalDirt;
         private float _currentDirt;
 
-        private bool _isDirty;
-
-        // 최적화: 브러시 알파 캐시
-        private float[] _brushAlphaCache;
-        private int _cachedBrushSize;
-        private Texture2D _cachedBrushTexture;
-
-        // 최적화: 더티 영역 추적 (부분 업데이트용)
-        private int _dirtyMinX;
-        private int _dirtyMinY;
-        private int _dirtyMaxX;
-        private int _dirtyMaxY;
-        private bool _hasDirtyRect;
+        private bool _isInitialized;
+        private bool _hasPendingChanges;
+        private bool _isReadbackPending;
+        private float _nextReadbackTime;
+        private int _maskVersion;
 
         #endregion
 
@@ -54,7 +107,7 @@ namespace CleanUp
         {
             get
             {
-                if (_totalDirt <= 0)
+                if (_totalDirt <= 0f)
                 {
                     return 1f;
                 }
@@ -62,66 +115,55 @@ namespace CleanUp
             }
         }
 
+        /// <summary>
+        /// 초기 상태의 전체 더러움 양 (메쉬가 차지하는 텍셀 기준)입니다.
+        /// </summary>
+        public float TotalDirt => _totalDirt;
+
+        /// <summary>
+        /// 남아 있는 더러움 양입니다. GPU 읽기 주기만큼 지연될 수 있습니다.
+        /// </summary>
+        public float CurrentDirt => _currentDirt;
+
         #endregion
 
         #region Unity 메소드
 
         private void Awake()
         {
-            _meshRenderer = GetComponent<MeshRenderer>();
-            InitializeDirtMask();
-            SetupMaterial();
-            if (resetButton == null) return;
-            resetButton.onClick.AddListener(ResetDirt);
+            Initialize();
         }
 
-        private void LateUpdate()
-        {   
-            // 전체영역 업데이트
-            if (_isDirty)
+        private void Update()
+        {
+            if (!_isInitialized || !_hasPendingChanges || _isReadbackPending)
             {
-                _dirtMask.SetPixels(_maskPixels);  // 전체
-                _dirtMask.Apply();
-                _isDirty = false;
+                return;
             }
-            // 최적화용 - 프레임당 한 번만 텍스처 업데이트 (더티 영역만)
-            // if (_isDirty && _hasDirtyRect)
-            // {
-            //     int width = _dirtyMaxX - _dirtyMinX + 1;
-            //     int height = _dirtyMaxY - _dirtyMinY + 1;
 
-            //     // 더티 영역의 픽셀만 추출
-            //     Color[] dirtyPixels = new Color[width * height];
-            //     for (int y = 0; y < height; y++)
-            //     {
-            //         for (int x = 0; x < width; x++)
-            //         {
-            //             int srcIdx = (_dirtyMinY + y) * MaskResolution + (_dirtyMinX + x);
-            //             int dstIdx = y * width + x;
-            //             dirtyPixels[dstIdx] = _maskPixels[srcIdx];
-            //         }
-            //     }
+            if (Time.unscaledTime < _nextReadbackTime)
+            {
+                return;
+            }
 
-            //     // 부분 영역만 업데이트
-            //     _dirtMask.SetPixels(_dirtyMinX, _dirtyMinY, width, height, dirtyPixels);
-            //     _dirtMask.Apply(false, false);
-
-            //     // 더티 상태 초기화
-            //     _isDirty = false;
-            //     _hasDirtyRect = false;
-            //     _dirtyMinX = MaskResolution;
-            //     _dirtyMinY = MaskResolution;
-            //     _dirtyMaxX = 0;
-            //     _dirtyMaxY = 0;
-            // }
+            _hasPendingChanges = false;
+            _nextReadbackTime = Time.unscaledTime + progressUpdateInterval;
+            RequestProgressReadback();
         }
 
         private void OnDestroy()
         {
-            if (_dirtMask != null)
+            _isInitialized = false;
+            ReleaseTexture(ref _maskTexture);
+            ReleaseTexture(ref _displayTexture);
+            ReleaseTexture(ref _coverageTexture);
+
+            if (_paintMaterial != null)
             {
-                Destroy(_dirtMask);
+                Destroy(_paintMaterial);
             }
+
+            _commandBuffer?.Release();
         }
 
         #endregion
@@ -129,41 +171,145 @@ namespace CleanUp
         #region 초기화
 
         /// <summary>
-        /// 더러움 마스크 텍스처를 초기화합니다.
+        /// 마스크 텍스처, 페인트 머티리얼, 커버리지를 초기화합니다.
         /// </summary>
-        private void InitializeDirtMask()
+        private void Initialize()
         {
-            _dirtMask = new Texture2D(MaskResolution, MaskResolution, TextureFormat.RGBA32, false);
-            _dirtMask.wrapMode = TextureWrapMode.Clamp;
-            _dirtMask.filterMode = FilterMode.Bilinear;
+            _meshRenderer = GetComponent<MeshRenderer>();
+            Mesh mesh = GetComponent<MeshFilter>().sharedMesh;
 
-            _maskPixels = new Color[MaskResolution * MaskResolution];
-            for (int i = 0; i < _maskPixels.Length; i++)
+            if (mesh == null)
             {
-                _maskPixels[i] = new Color(initialDirtAmount, 0, 0, 1);
+                Debug.LogError($"[DirtySurface] {name}: MeshFilter에 메쉬가 없습니다.", this);
+                return;
             }
 
-            _dirtMask.SetPixels(_maskPixels);
-            _dirtMask.Apply();
+            if (paintShader == null)
+            {
+                paintShader = Shader.Find(PaintShaderName);
+            }
 
-            _totalDirt = initialDirtAmount * _maskPixels.Length;
+            if (paintShader == null)
+            {
+                Debug.LogError($"[DirtySurface] {name}: 페인트 셰이더({PaintShaderName})를 찾을 수 없습니다.", this);
+                return;
+            }
+
+            _subMeshCount = mesh.subMeshCount;
+            _maskUVChannel = SelectMaskUVChannel(mesh);
+
+            _paintMaterial = new Material(paintShader);
+            _paintMaterial.SetFloat(maskUVChannelId, _maskUVChannel);
+
+            _commandBuffer = new CommandBuffer { name = "DirtySurface Paint" };
+
+            _maskTexture = CreateMaskTexture("DirtMask");
+            _displayTexture = CreateMaskTexture("DirtMaskDisplay");
+            _coverageTexture = CreateMaskTexture("DirtMaskCoverage");
+            _readbackBuffer = new ushort[maskResolution * maskResolution];
+
+            SetupMaterial();
+            BuildCoverage();
+            FillMask(initialDirtAmount);
+
+            _totalDirt = initialDirtAmount * _coveredIndices.Length;
             _currentDirt = _totalDirt;
-
-            // 더티 영역 초기화
-            _dirtyMinX = MaskResolution;
-            _dirtyMinY = MaskResolution;
-            _dirtyMaxX = 0;
-            _dirtyMaxY = 0;
-            _hasDirtyRect = false;
+            _isInitialized = true;
         }
 
         /// <summary>
-        /// 머티리얼에 더러움 마스크 텍스처를 연결합니다.
+        /// 마스크에 사용할 UV 채널을 결정합니다.
+        /// </summary>
+        /// <param name="mesh">대상 메쉬</param>
+        /// <returns>0이면 UV0, 1이면 UV1</returns>
+        private float SelectMaskUVChannel(Mesh mesh)
+        {
+            if (!useSecondaryUV)
+            {
+                return 0f;
+            }
+
+            if (mesh.HasVertexAttribute(VertexAttribute.TexCoord1))
+            {
+                return 1f;
+            }
+
+            Debug.LogWarning($"[DirtySurface] {name}: 메쉬에 UV2가 없어 UV0를 사용합니다. " +
+                             "UV가 겹치면 다른 부위가 함께 닦이니 모델 Import 설정에서 Generate Lightmap UVs를 켜세요.", this);
+            return 0f;
+        }
+
+        /// <summary>
+        /// 마스크용 RenderTexture를 생성합니다.
+        /// </summary>
+        /// <param name="textureName">텍스처 이름</param>
+        private RenderTexture CreateMaskTexture(string textureName)
+        {
+            RenderTexture texture = new RenderTexture(maskResolution, maskResolution, 0, RenderTextureFormat.RHalf, RenderTextureReadWrite.Linear)
+            {
+                name = textureName,
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear,
+                useMipMap = false
+            };
+            texture.Create();
+            return texture;
+        }
+
+        /// <summary>
+        /// 렌더러에 표시용 마스크와 UV 채널을 연결합니다.
         /// </summary>
         private void SetupMaterial()
         {
-            Material instanceMaterial = _meshRenderer.material;
-            instanceMaterial.SetTexture("_DirtMask", _dirtMask);
+            _propertyBlock = new MaterialPropertyBlock();
+            _meshRenderer.GetPropertyBlock(_propertyBlock);
+            _propertyBlock.SetTexture(dirtMaskId, _displayTexture);
+            _propertyBlock.SetFloat(maskUVChannelId, _maskUVChannel);
+            _meshRenderer.SetPropertyBlock(_propertyBlock);
+        }
+
+        /// <summary>
+        /// 메쉬를 UV 공간에 펼쳐 그려서 실제로 사용되는 텍셀 목록을 만듭니다.
+        /// </summary>
+        private void BuildCoverage()
+        {
+            _commandBuffer.Clear();
+            _commandBuffer.SetRenderTarget(_coverageTexture);
+            _commandBuffer.ClearRenderTarget(false, true, Color.clear);
+            DrawMesh(_commandBuffer, CoveragePass);
+            Graphics.ExecuteCommandBuffer(_commandBuffer);
+
+            ReadTextureImmediate(_coverageTexture);
+
+            List<int> covered = new List<int>(_readbackBuffer.Length / 2);
+            for (int i = 0; i < _readbackBuffer.Length; i++)
+            {
+                if (HalfToFloat(_readbackBuffer[i]) > 0.5f)
+                {
+                    covered.Add(i);
+                }
+            }
+            _coveredIndices = covered.ToArray();
+
+            if (_coveredIndices.Length == 0)
+            {
+                Debug.LogWarning($"[DirtySurface] {name}: 마스크 커버리지가 비어 있습니다. 메쉬 UV를 확인하세요.", this);
+            }
+        }
+
+        /// <summary>
+        /// 텍스처를 해제합니다.
+        /// </summary>
+        private static void ReleaseTexture(ref RenderTexture texture)
+        {
+            if (texture == null)
+            {
+                return;
+            }
+
+            texture.Release();
+            Destroy(texture);
+            texture = null;
         }
 
         #endregion
@@ -171,157 +317,46 @@ namespace CleanUp
         #region 청소 관련
 
         /// <summary>
-        /// UV 좌표 기반으로 지정된 영역을 청소합니다.
+        /// 브러시 스탬프들을 마스크에 적용합니다. 한 프레임의 스탬프를 모아서 한 번에 호출하세요.
         /// </summary>
-        public void CleanArea(
-            Vector2 centerUV, Vector3 hitNormal, Vector3 viewDirection,
-            float radius, float strength, float angleThreshold,
-            AnimationCurve distanceCurve, AnimationCurve angleCurve, Texture2D brushTexture
-            )
+        /// <param name="stamps">찍을 브러시 스탬프 목록</param>
+        /// <param name="radius">브러시 반경 (월드 단위)</param>
+        /// <param name="brushTexture">브러시 모양 텍스처 (알파 사용, null이면 원형)</param>
+        /// <param name="brushTiling">브러시 안에서 패턴이 반복되는 횟수</param>
+        /// <param name="patternInfluence">브러시 패턴 영향도 (0=패턴 무시, 1=패턴 알파 그대로)</param>
+        /// <param name="falloffLut">감쇠 LUT (R=거리, G=각도)</param>
+        /// <param name="cameraPosition">시선 각도 계산용 카메라 위치</param>
+        public void Paint(IReadOnlyList<BrushStamp> stamps, float radius, Texture brushTexture, float brushTiling, float patternInfluence, Texture falloffLut, Vector3 cameraPosition)
         {
-            int centerX = Mathf.RoundToInt(centerUV.x * MaskResolution);
-            int centerY = Mathf.RoundToInt(centerUV.y * MaskResolution);
-            int radiusPixels = Mathf.CeilToInt(radius * MaskResolution);
-
-            if (radiusPixels < 1)
-            {
-                radiusPixels = 1;
-            }
-
-            // 브러시 캐시 업데이트
-            CacheBrushAlpha(brushTexture, radiusPixels);
-
-            float cosThreshold = Mathf.Cos(angleThreshold * Mathf.Deg2Rad);
-
-            // 법선과 시선 방향의 각도 계산 (시선 반전)
-            float dotProduct = Vector3.Dot(hitNormal, -viewDirection);
-
-            if (dotProduct <= 0)
-            {
-                return; // 뒷면은 청소하지 않음
-            }
-
-            float angleEfficiency;
-            if (dotProduct < cosThreshold)
-            {
-                float normalizedAngle = dotProduct / cosThreshold;
-                angleEfficiency = normalizedAngle * normalizedAngle * 0.2f;
-            }
-            else
-            {
-                float normalizedAngle = (dotProduct - cosThreshold) / (1f - cosThreshold);
-                angleEfficiency = normalizedAngle * normalizedAngle * (3f - 2f * normalizedAngle);
-            }
-
-            int radiusSq = radiusPixels * radiusPixels;
-            int diameter = radiusPixels * 2 + 1;
-            float dirtRemoved = 0f;
-
-            for (int dy = -radiusPixels; dy <= radiusPixels; dy++)
-            {
-                int py = centerY + dy;
-                if (py < 0 || py >= MaskResolution)
-                {
-                    continue;
-                }
-
-                for (int dx = -radiusPixels; dx <= radiusPixels; dx++)
-                {
-                    int px = centerX + dx;
-                    if (px < 0 || px >= MaskResolution)
-                    {
-                        continue;
-                    }
-
-                    // 제곱 거리로 비교 (Sqrt 제거)
-                    int distSq = dx * dx + dy * dy;
-                    if (distSq > radiusSq)
-                    {
-                        continue;
-                    }
-
-                    // 캐시된 브러시 알파
-                    int brushIdx = (dy + radiusPixels) * diameter + (dx + radiusPixels);
-                    float brushAlpha = _brushAlphaCache[brushIdx];
-
-                    if (brushAlpha <= 0.01f)
-                    {
-                        continue;
-                    }
-
-                    // 거리 감쇠
-                    float normalizedDist = 1f - Mathf.Sqrt((float)distSq / radiusSq);
-                    float distanceFalloff = normalizedDist * normalizedDist * (3f - 2f * normalizedDist);
-
-                    // 최종 강도
-                    float finalStrength = strength * distanceFalloff * angleEfficiency * brushAlpha;
-
-                    if (finalStrength <= 0.001f)
-                    {
-                        continue;
-                    }
-
-                    int index = py * MaskResolution + px;
-                    float oldValue = _maskPixels[index].r;
-                    float newValue = oldValue - finalStrength;
-
-                    if (newValue < 0f)
-                    {
-                        newValue = 0f;
-                    }
-
-                    if (oldValue != newValue)
-                    {
-                        _maskPixels[index].r = newValue;
-                        dirtRemoved += (oldValue - newValue);
-                        _isDirty = true;
-                    }
-                }
-            }
-
-            _currentDirt = Mathf.Max(0f, _currentDirt - dirtRemoved);
-        }
-
-        /// <summary>
-        /// 브러시 알파 캐시를 생성합니다.
-        /// </summary>
-        private void CacheBrushAlpha(Texture2D brushTexture, int radiusPixels)
-        {
-            if (brushTexture == _cachedBrushTexture && radiusPixels == _cachedBrushSize && _brushAlphaCache != null)
+            if (!_isInitialized || stamps.Count == 0 || radius <= 0f)
             {
                 return;
             }
 
-            int diameter = radiusPixels * 2 + 1;
-            _brushAlphaCache = new float[diameter * diameter];
-            _cachedBrushSize = radiusPixels;
-            _cachedBrushTexture = brushTexture;
+            _commandBuffer.Clear();
+            _commandBuffer.SetRenderTarget(_maskTexture);
+            _commandBuffer.SetGlobalTexture(brushTexId, brushTexture != null ? brushTexture : Texture2D.whiteTexture);
+            _commandBuffer.SetGlobalTexture(falloffLutId, falloffLut != null ? falloffLut : Texture2D.whiteTexture);
+            _commandBuffer.SetGlobalVector(cameraPosId, cameraPosition);
 
-            if (brushTexture == null)
+            for (int i = 0; i < stamps.Count; i++)
             {
-                for (int dy = -radiusPixels; dy <= radiusPixels; dy++)
+                BrushStamp stamp = stamps[i];
+                if (stamp.strength <= 0f)
                 {
-                    for (int dx = -radiusPixels; dx <= radiusPixels; dx++)
-                    {
-                        int idx = (dy + radiusPixels) * diameter + (dx + radiusPixels);
-                        float distSq = (dx * dx + dy * dy) / (float)(radiusPixels * radiusPixels);
-                        _brushAlphaCache[idx] = distSq <= 1f ? 1f : 0f;
-                    }
+                    continue;
                 }
+
+                Vector3 normal = stamp.normal.normalized;
+                _commandBuffer.SetGlobalVector(brushPosId, new Vector4(stamp.position.x, stamp.position.y, stamp.position.z, radius));
+                _commandBuffer.SetGlobalVector(brushNormalId, new Vector4(normal.x, normal.y, normal.z, stamp.strength));
+                _commandBuffer.SetGlobalVector(brushParamsId, new Vector4(brushTiling, stamp.rotation, patternInfluence, 0f));
+                DrawMesh(_commandBuffer, PaintPass);
             }
-            else
-            {
-                for (int dy = -radiusPixels; dy <= radiusPixels; dy++)
-                {
-                    for (int dx = -radiusPixels; dx <= radiusPixels; dx++)
-                    {
-                        int idx = (dy + radiusPixels) * diameter + (dx + radiusPixels);
-                        float brushU = (dx + radiusPixels) / (float)(radiusPixels * 2);
-                        float brushV = (dy + radiusPixels) / (float)(radiusPixels * 2);
-                        _brushAlphaCache[idx] = brushTexture.GetPixelBilinear(brushU, brushV).a;
-                    }
-                }
-            }
+
+            AppendDilate(_commandBuffer);
+            Graphics.ExecuteCommandBuffer(_commandBuffer);
+            _hasPendingChanges = true;
         }
 
         /// <summary>
@@ -329,14 +364,12 @@ namespace CleanUp
         /// </summary>
         public void ResetDirt()
         {
-            for (int i = 0; i < _maskPixels.Length; i++)
+            if (!_isInitialized)
             {
-                _maskPixels[i].r = initialDirtAmount;
+                return;
             }
 
-            _dirtMask.SetPixels(_maskPixels);
-            _dirtMask.Apply();
-
+            FillMask(initialDirtAmount);
             _currentDirt = _totalDirt;
         }
 
@@ -345,15 +378,153 @@ namespace CleanUp
         /// </summary>
         public void CleanAll()
         {
-            for (int i = 0; i < _maskPixels.Length; i++)
+            if (!_isInitialized)
             {
-                _maskPixels[i].r = 0f;
+                return;
             }
 
-            _dirtMask.SetPixels(_maskPixels);
-            _dirtMask.Apply();
-
+            FillMask(0f);
             _currentDirt = 0f;
+        }
+
+        /// <summary>
+        /// 마스크 전체를 지정한 값으로 채우고, 진행 중인 읽기 결과를 무효화합니다.
+        /// </summary>
+        /// <param name="value">채울 더러움 값</param>
+        private void FillMask(float value)
+        {
+            Color color = new Color(value, value, value, value);
+
+            _commandBuffer.Clear();
+            _commandBuffer.SetRenderTarget(_maskTexture);
+            _commandBuffer.ClearRenderTarget(false, true, color);
+            _commandBuffer.SetRenderTarget(_displayTexture);
+            _commandBuffer.ClearRenderTarget(false, true, color);
+            Graphics.ExecuteCommandBuffer(_commandBuffer);
+
+            _maskVersion++;
+            _hasPendingChanges = false;
+        }
+
+        /// <summary>
+        /// 모든 서브메쉬를 지정한 패스로 그리는 명령을 추가합니다.
+        /// </summary>
+        private void DrawMesh(CommandBuffer commandBuffer, int pass)
+        {
+            for (int subMesh = 0; subMesh < _subMeshCount; subMesh++)
+            {
+                commandBuffer.DrawRenderer(_meshRenderer, _paintMaterial, subMesh, pass);
+            }
+        }
+
+        /// <summary>
+        /// 페인팅 결과를 UV 섬 바깥으로 확장해 표시용 마스크에 복사하는 명령을 추가합니다.
+        /// </summary>
+        private void AppendDilate(CommandBuffer commandBuffer)
+        {
+            commandBuffer.SetGlobalTexture(sourceTexId, _maskTexture);
+            commandBuffer.SetGlobalTexture(coverageTexId, _coverageTexture);
+            commandBuffer.SetGlobalVector(maskSizeId, new Vector4(maskResolution, maskResolution, 0f, 0f));
+            commandBuffer.SetRenderTarget(_displayTexture);
+            commandBuffer.DrawProcedural(Matrix4x4.identity, _paintMaterial, DilatePass, MeshTopology.Triangles, 3);
+        }
+
+        #endregion
+
+        #region 진행도 계산
+
+        /// <summary>
+        /// 마스크를 GPU에서 읽어 남은 더러움 양을 갱신하도록 요청합니다.
+        /// </summary>
+        private void RequestProgressReadback()
+        {
+            int version = _maskVersion;
+
+            if (!SystemInfo.supportsAsyncGPUReadback)
+            {
+                ReadTextureImmediate(_maskTexture);
+                ApplyReadback(version);
+                return;
+            }
+
+            _isReadbackPending = true;
+            AsyncGPUReadback.Request(_maskTexture, 0, request =>
+            {
+                _isReadbackPending = false;
+
+                if (!_isInitialized || request.hasError)
+                {
+                    return;
+                }
+
+                request.GetData<ushort>().CopyTo(_readbackBuffer);
+                ApplyReadback(version);
+            });
+        }
+
+        /// <summary>
+        /// 읽어온 마스크 데이터로 남은 더러움 양을 계산합니다.
+        /// </summary>
+        /// <param name="version">요청 시점의 마스크 버전 (리셋 이후 도착한 결과는 무시)</param>
+        private void ApplyReadback(int version)
+        {
+            if (version != _maskVersion)
+            {
+                return;
+            }
+
+            float dirt = 0f;
+            for (int i = 0; i < _coveredIndices.Length; i++)
+            {
+                dirt += Mathf.Max(0f, HalfToFloat(_readbackBuffer[_coveredIndices[i]]));
+            }
+
+            _currentDirt = Mathf.Clamp(dirt, 0f, _totalDirt);
+        }
+
+        /// <summary>
+        /// RenderTexture를 즉시 읽어 읽기 버퍼에 복사합니다.
+        /// </summary>
+        private void ReadTextureImmediate(RenderTexture source)
+        {
+            if (SystemInfo.supportsAsyncGPUReadback)
+            {
+                AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(source);
+                request.WaitForCompletion();
+
+                if (!request.hasError)
+                {
+                    request.GetData<ushort>().CopyTo(_readbackBuffer);
+                    return;
+                }
+            }
+
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture.active = source;
+
+            Texture2D texture = new Texture2D(source.width, source.height, TextureFormat.RHalf, false, true);
+            texture.ReadPixels(new Rect(0, 0, source.width, source.height), 0, 0, false);
+            RenderTexture.active = previous;
+
+            texture.GetPixelData<ushort>(0).CopyTo(_readbackBuffer);
+            Destroy(texture);
+        }
+
+        /// <summary>
+        /// half(16비트) 값을 float로 변환합니다. (조회 테이블 사용)
+        /// </summary>
+        private static float HalfToFloat(ushort value)
+        {
+            if (halfToFloatTable == null)
+            {
+                halfToFloatTable = new float[ushort.MaxValue + 1];
+                for (int i = 0; i <= ushort.MaxValue; i++)
+                {
+                    halfToFloatTable[i] = Mathf.HalfToFloat((ushort)i);
+                }
+            }
+
+            return halfToFloatTable[value];
         }
 
         #endregion

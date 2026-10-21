@@ -5,6 +5,7 @@ Shader "Custom/DirtMaskShader_URP"
         _MainTex ("Base Texture", 2D) = "white" {}
         _MainColor ("Base Color", Color) = (1,1,1,1)
         _DirtMask ("Dirt Mask (R Channel)", 2D) = "white" {}
+        _MaskUVChannel ("Mask UV Channel (0=UV0, 1=UV1)", Float) = 0
         _DirtTex ("Dirt Pattern Texture", 2D) = "white" {}
         _DirtColor ("Dirt Color", Color) = (0.4, 0.3, 0.2, 1)
         _DirtIntensity ("Dirt Intensity", Range(0, 1)) = 0.8
@@ -35,11 +36,14 @@ Shader "Custom/DirtMaskShader_URP"
             #pragma vertex vert
             #pragma fragment frag
 
-            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS
-            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE
+            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE
             #pragma multi_compile _ _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS
-            #pragma multi_compile _ _ADDITIONAL_LIGHT_SHADOWS
-            #pragma multi_compile _ _SHADOWS_SOFT
+            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
+            #pragma multi_compile_fragment _ _SHADOWS_SOFT _SHADOWS_SOFT_LOW _SHADOWS_SOFT_MEDIUM _SHADOWS_SOFT_HIGH
+            #pragma multi_compile_fragment _ _SCREEN_SPACE_OCCLUSION
+            #pragma multi_compile _ _LIGHT_LAYERS
+            // Forward+ 렌더러에서 메인 라이트 감쇠/추가 라이트 루프가 동작하려면 필요
+            #pragma multi_compile _ _CLUSTER_LIGHT_LOOP
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
@@ -50,6 +54,7 @@ Shader "Custom/DirtMaskShader_URP"
                 float3 normalOS : NORMAL;
                 float4 tangentOS : TANGENT;
                 float2 uv : TEXCOORD0;
+                float2 uv1 : TEXCOORD1;
             };
 
             struct Varyings
@@ -60,6 +65,8 @@ Shader "Custom/DirtMaskShader_URP"
                 float3 normalWS : TEXCOORD2;
                 float3 tangentWS : TEXCOORD3;
                 float3 bitangentWS : TEXCOORD4;
+                float2 rawUV : TEXCOORD5;
+                float2 maskUV : TEXCOORD6;
             };
 
             TEXTURE2D(_MainTex);
@@ -83,6 +90,7 @@ Shader "Custom/DirtMaskShader_URP"
                 half _Smoothness;
                 half _Metallic;
                 half _BumpScale;
+                float _MaskUVChannel;
             CBUFFER_END
 
             Varyings vert(Attributes input)
@@ -95,6 +103,8 @@ Shader "Custom/DirtMaskShader_URP"
                 output.positionCS = vertexInput.positionCS;
                 output.positionWS = vertexInput.positionWS;
                 output.uv = TRANSFORM_TEX(input.uv, _MainTex);
+                output.rawUV = input.uv;
+                output.maskUV = lerp(input.uv, input.uv1, _MaskUVChannel);
 
                 output.normalWS = normalInput.normalWS;
                 output.tangentWS = normalInput.tangentWS;
@@ -109,10 +119,10 @@ Shader "Custom/DirtMaskShader_URP"
                 half4 baseColor = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv) * _MainColor;
 
                 // 더러움 마스크 (R 채널)
-                half dirtAmount = SAMPLE_TEXTURE2D(_DirtMask, sampler_DirtMask, input.uv).r;
+                half dirtAmount = saturate(SAMPLE_TEXTURE2D(_DirtMask, sampler_DirtMask, input.maskUV).r);
 
                 // 얼룩 패턴 (타일링 적용)
-                float2 dirtUV = input.uv * _DirtTex_ST.xy + _DirtTex_ST.zw;
+                float2 dirtUV = TRANSFORM_TEX(input.rawUV, _DirtTex);
                 half4 dirtPattern = SAMPLE_TEXTURE2D(_DirtTex, sampler_DirtTex, dirtUV);
 
                 // 더러움 컬러 계산
@@ -128,7 +138,7 @@ Shader "Custom/DirtMaskShader_URP"
                 half3 normalTS = UnpackNormalScale(normalMap, _BumpScale);
 
                 float3x3 tangentToWorld = float3x3(input.tangentWS, input.bitangentWS, input.normalWS);
-                half3 normalWS = normalize(mul(normalTS, tangentToWorld));
+                half3 normalWS = SafeNormalize(mul(normalTS, tangentToWorld));
 
                 // 라이팅 계산
                 InputData lightingInput = (InputData)0;
@@ -136,6 +146,8 @@ Shader "Custom/DirtMaskShader_URP"
                 lightingInput.normalWS = normalWS;
                 lightingInput.viewDirectionWS = GetWorldSpaceNormalizeViewDir(input.positionWS);
                 lightingInput.shadowCoord = TransformWorldToShadowCoord(input.positionWS);
+                lightingInput.bakedGI = SampleSH(normalWS);
+                lightingInput.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(input.positionCS);
 
                 // Surface Data
                 SurfaceData surfaceData = (SurfaceData)0;
@@ -143,6 +155,7 @@ Shader "Custom/DirtMaskShader_URP"
                 surfaceData.metallic = _Metallic;
                 surfaceData.smoothness = _Smoothness * (1.0 - dirtAmount * 0.3);
                 surfaceData.normalTS = normalTS;
+                surfaceData.occlusion = 1.0;
                 surfaceData.alpha = 1.0;
 
                 // PBR 라이팅

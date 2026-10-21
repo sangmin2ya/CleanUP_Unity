@@ -113,7 +113,7 @@ namespace CleanUp
         public void FindAllDirtySurfaces()
         {
             _dirtySurfaces.Clear();
-            DirtySurface[] surfaces = FindObjectsOfType<DirtySurface>();
+            DirtySurface[] surfaces = FindObjectsByType<DirtySurface>(FindObjectsSortMode.None);
 
             foreach (var surface in surfaces)
             {
@@ -140,27 +140,29 @@ namespace CleanUp
         #region 진행도 계산
 
         /// <summary>
-        /// 전체 청소 진행도를 계산합니다.
+        /// 전체 청소 진행도를 계산합니다. 표면별 더러움 양(면적)으로 가중 평균합니다.
         /// </summary>
         private void CalculateOverallProgress()
         {
-            if (_dirtySurfaces.Count == 0)
-            {
-                OverallProgress = 0f;
-                return;
-            }
-
-            float totalProgress = 0f;
+            float totalDirt = 0f;
+            float currentDirt = 0f;
 
             foreach (var surface in _dirtySurfaces)
             {
                 if (surface != null)
                 {
-                    totalProgress += surface.CleanProgress;
+                    totalDirt += surface.TotalDirt;
+                    currentDirt += surface.CurrentDirt;
                 }
             }
 
-            OverallProgress = totalProgress / _dirtySurfaces.Count;
+            if (totalDirt <= 0f)
+            {
+                OverallProgress = 0f;
+                return;
+            }
+
+            OverallProgress = Mathf.Clamp01(1f - (currentDirt / totalDirt));
         }
 
         #endregion
@@ -279,6 +281,7 @@ namespace CleanUp
                 completionPanel.SetActive(false);
             }
 
+            UpdateUI();
             Debug.Log("[GameManager] 게임 재시작");
         }
 

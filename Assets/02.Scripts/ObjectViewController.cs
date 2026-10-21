@@ -55,7 +55,7 @@ namespace CleanUp
         {
             if (targetObject == null)
             {
-                DirtySurface surface = FindObjectOfType<DirtySurface>();
+                DirtySurface surface = FindFirstObjectByType<DirtySurface>();
                 if (surface != null)
                 {
                     targetObject = surface.transform;
