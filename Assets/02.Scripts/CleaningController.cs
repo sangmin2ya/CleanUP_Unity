@@ -83,7 +83,12 @@ namespace CleanUp
         private Vector3 _lastHitPoint;
         private Vector3 _lastHitNormal;
         private float _smoothedSpeed;
+        private bool _hasSpeedSample;
         private bool _hasHit;
+
+        // 마지막으로 조회한 콜라이더의 DirtySurface (매 프레임 GetComponentInParent 방지)
+        private Collider _cachedCollider;
+        private DirtySurface _cachedSurface;
 
         #endregion
 
@@ -139,7 +144,7 @@ namespace CleanUp
 
             // 우클릭(회전) 중에는 청소하지 않음
             bool isCleaning = Mouse.current.leftButton.isPressed && !Mouse.current.rightButton.isPressed;
-            DirtySurface surface = _hasHit ? hit.collider.GetComponentInParent<DirtySurface>() : null;
+            DirtySurface surface = _hasHit ? GetSurface(hit.collider) : null;
 
             if (isCleaning && surface != null)
             {
@@ -252,7 +257,8 @@ namespace CleanUp
                 for (int i = 1; i < stampCount; i++)
                 {
                     Vector2 stepPosition = Vector2.Lerp(_lastScreenPosition, screenPosition, (float)i / stampCount);
-                    if (TryRaycast(stepPosition, out RaycastHit stepHit) && stepHit.collider == hit.collider)
+                    // 같은 표면이면 자식 콜라이더가 달라도 이어서 찍음 (스트로크 연속 판정과 같은 기준)
+                    if (TryRaycast(stepPosition, out RaycastHit stepHit) && GetSurface(stepHit.collider) == surface)
                     {
                         _stamps.Add(new BrushStamp(stepHit.point, stepHit.normal, stampStrength, NextStampRotation()));
                     }
@@ -284,10 +290,20 @@ namespace CleanUp
             if (!isContinuing)
             {
                 _smoothedSpeed = 0f;
+                _hasSpeedSample = false;
                 return;
             }
 
             float speed = frameDistance / Mathf.Max(deltaTime, 0.0001f);
+
+            // 스트로크 첫 측정값은 그대로 사용 (0에서 서서히 올라가면 빠른 스트로크 시작 구간이 과하게 닦임)
+            if (!_hasSpeedSample)
+            {
+                _smoothedSpeed = speed;
+                _hasSpeedSample = true;
+                return;
+            }
+
             _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, speed, 1f - Mathf.Exp(-speedSmoothing * deltaTime));
         }
 
@@ -307,6 +323,22 @@ namespace CleanUp
             _hasPreviousPosition = false;
             _lastSurface = null;
             _smoothedSpeed = 0f;
+            _hasSpeedSample = false;
+        }
+
+        /// <summary>
+        /// 콜라이더가 속한 DirtySurface를 반환합니다. 같은 콜라이더면 이전 결과를 재사용합니다.
+        /// </summary>
+        /// <param name="collider">레이캐스트에 맞은 콜라이더</param>
+        private DirtySurface GetSurface(Collider collider)
+        {
+            if (collider != _cachedCollider)
+            {
+                _cachedCollider = collider;
+                _cachedSurface = collider.GetComponentInParent<DirtySurface>();
+            }
+
+            return _cachedSurface;
         }
 
         /// <summary>

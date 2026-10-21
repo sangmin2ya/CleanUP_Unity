@@ -86,6 +86,7 @@ namespace CleanUp
 
         private int[] _coveredIndices;
         private ushort[] _readbackBuffer;
+        private Texture2D _fallbackReadTexture; // 비동기 읽기를 지원하지 않을 때 재사용하는 읽기용 텍스처
 
         private float _totalDirt;
         private float _currentDirt;
@@ -161,6 +162,11 @@ namespace CleanUp
             if (_paintMaterial != null)
             {
                 Destroy(_paintMaterial);
+            }
+
+            if (_fallbackReadTexture != null)
+            {
+                Destroy(_fallbackReadTexture);
             }
 
             _commandBuffer?.Release();
@@ -502,12 +508,15 @@ namespace CleanUp
             RenderTexture previous = RenderTexture.active;
             RenderTexture.active = source;
 
-            Texture2D texture = new Texture2D(source.width, source.height, TextureFormat.RHalf, false, true);
-            texture.ReadPixels(new Rect(0, 0, source.width, source.height), 0, 0, false);
+            if (_fallbackReadTexture == null)
+            {
+                _fallbackReadTexture = new Texture2D(source.width, source.height, TextureFormat.RHalf, false, true);
+            }
+
+            _fallbackReadTexture.ReadPixels(new Rect(0, 0, source.width, source.height), 0, 0, false);
             RenderTexture.active = previous;
 
-            texture.GetPixelData<ushort>(0).CopyTo(_readbackBuffer);
-            Destroy(texture);
+            _fallbackReadTexture.GetPixelData<ushort>(0).CopyTo(_readbackBuffer);
         }
 
         /// <summary>
